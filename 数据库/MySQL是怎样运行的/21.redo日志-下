@@ -1,0 +1,103 @@
+redo 日志刷盘时机
+    log buffer 空间不足
+        这是一个被动的、保证系统持续运行的机制，受 innodb_log_buffer_size 配置影响
+        触发后，产生 redo 日志的 DML 操作都将被挂起，直到有空间被释放为止
+    事务提交时
+        具体取决于 innodb_flush_log_at_trx_commit 配置
+        该值为 1 时，每次事务提交都会执行一次 Log Buffer 的写入（write）和同步刷新（fsync）操作
+        fsync 会强制操作系统将缓存数据写入物理磁盘，牺牲了性能但保证了持久性
+    后台线程
+        数据库会有一个或多个专用的后台线程/进程，以固定的时间间隔自动执行刷盘任务
+        mysql 大概是每秒 1 次，该制平滑了 I/O 负载
+    正常关闭服务器
+        关闭流程重要的一步就是将内存中所有脏数据和 Log Buffer 中所有未写入的 redo 日志刷盘
+        强制将所有已提交事务的修改全部写入数据文件，并确保了 redo 日志与数据文件的一致性
+        数据库处于一个完全一致的状态，可以实现快速启动，无需崩溃恢复
+    checkpoint
+        Checkpoint 并不直接触发 Log Buffer 刷盘，而是与 redo 日志管理密切相关
+
+redo 日志文件组
+    数据目录的 ib_logfile0 和 ib_logfile1 为默认 redo 日志文件
+    可以启动时指定其：所在目录（默认数据目录）/大小（默认48MB）/个数（默认2个）
+    写入的方式是循环写，最后一个写满之后会跳到第一个继续写
+redo 日志文件格
+    由 block 组成，和 log buffer 中的 block 一致，都是512字节
+    每个日志文件前 4 个block （2048 字节）存储管理信息
+        第 1 个 block：log file header 描述该 redo 日志文件的整体属性
+            LOG_HEADER_START_LSN 标记该 redo 日志开始的LSN值
+        第 2 个 block：checkpoint1 记录关于 checkpoint 的属性
+            checkpoint 编号
+            checkpoint_lsn 恢复的起点，checkpoint 结束时对应的 LSN
+            checkpoint_offset 记录 checkpoint_lsn 日志偏移
+        第 3 个 block：未使用
+        第 4 个 block：checkpoint2 作用同第 2 个
+    每个日志文件从第 5 个 block 开始存储 log buffer 的 block 镜像
+    循环写是从每个日志文件的第 2048 个字节开始
+Log Sequeue Numb（LSN）
+    lsn 值
+        标识 redo 日志量，不断递增，lsn 初始值为 8704
+        计算 lsn 需加上 log block header（12） 和 log block trailer（4）
+        每个 mtr 生成的一组 redo 日志，都有一个唯一的 LSN 值与其对应
+        LSN 值越小，说明 redo 日志产生的越早
+    flushed_to_disk_lsn
+        buf_next_to_write 指向 log buffer 下一个需要写入磁盘的位置
+        buf_free 指向 log buffer 下一次写入 redo 日志的位置
+        flushed_to_disk_lsn 记录 log buffer 中已经刷盘的 redo 日志量
+        lsn 记录总的 redo 日志的总量（包含 log buffer 中还没刷盘的 redo 日志）
+    lsn 值和 redo 日志文件偏移量的对应关系
+        初始 LSN 是 8704 ，对应文件偏移量 2048 
+        之后每个 mtr 向磁盘中写入多少字节日志，lsn 就增长多少
+        需要加上 log block header 和 log block trailer
+    flush 链表中的 LSN
+        oldest_modification：首次修改该页面的 mtr 的第一条 redo 日志对应的 lsn
+        newest_modification：最后修改该页面的 mtr 的最后一条 redo 日志对应的 lsn 值
+        flush 链表的脏页按第一次修改的发生时间（oldest_modification）排序（新的在前，老的在后）
+        多次更新的页面不会重复插入到 flush 链表，但会更新 newest_modification
+checkpoint
+    Innodb的一条事务日志共经历4个阶段
+        创建阶段：事务创建一条 redo 日志
+        日志刷盘：redo 日志写入到磁盘上的日志文件
+        数据刷盘：redo 日志对应的脏页数据写入到磁盘上的数据文件
+        写 CKP：日志被当作 Checkpoint 写入日志文件
+    为什么需要 checkpoint（触发条件）
+        redo 日志磁盘空间有限，checkpoint_lsn 标识可被覆盖的 redo 日志
+        崩溃恢复时，可以从 checkpoint_lsn 开始，而不是重放全部的 redo 日志
+        缓冲池不够用时，将脏页刷新到磁盘
+    checkpoint 分类
+        Fuzzy checkpoint：进行部分脏页的刷新，有效循环利用Redo日志
+        Sharp checkpoint：发生在关闭数据库时，将所有脏页刷回磁盘
+    步骤
+        【1】找到可覆盖的 redo 日志对应的 lsn 的最大值，赋值给 checkpoint_lsn
+            找到【最早修改的脏页】对应的 oldest_modification，这是【日志安全点】
+            LSN < 安全点的 redo 日志所记录的修改，都已经刷盘或被后续的修改覆盖/包含
+            在安全点之前产生的 redo 日志都可覆盖，将该值赋值给 checkpoint_lsn
+        【2】相关信息写入 checkpoint1 或 checkpoint2
+            将 checkpoint_lsn ，对应 redo 日志文件组偏移量，此次 checkpoint_no 编号
+            写到日志文件的管理信息（就是 checkpoint1 或者 checkpoint2 ）
+            checkpoint_no 是偶数就写到 checkpoint1，是奇数就写到 checkpoint2
+            关于 checkpoint 的信息只会写到日志文件组的【第一个日志文件】的管理信息中
+innodb_flush_log_at_trx_commit
+    0 事务提交，后台同步redo日志，无法保证持久性
+    1 事务提交，redo 日志同步到磁盘，可以保证持久性【默认配置】
+    2 事务提交，redo 日志写到操作系统缓冲区
+        数据库挂了操作系统没挂，可以保证持久性
+        操作系统挂了，无法保证持久性
+崩溃恢复
+    确定恢复的起点
+		确定恢复起点的相关信息都 redo 日志文件组的第一个 redo 日志文件中
+        比较其 checkpoint1 和 checkpoint2 这两个 block 的 checkpoint_no 
+        checkpoint_no 较大的 block 存储最近一次 checkpoint 信息
+        取得 checkpoint_lsn（恢复的起点） ，checkpoint_offset （日志偏移），checkpoint 编号
+    确定恢复的终点
+        普通 block 的 log block header 有 LOG_BLOCK_HDR_DATA_LEN 属性
+        填满的 block 该值为 512，第一个不是 512 的 block 就是崩溃恢复的最后一个 block
+    哈希表加速恢复
+        根据 redo 日志的 space ID 和 page number 属性计算出散列值
+        把 space ID 和 page number 相同的 redo 日志放到哈希表的同一个槽里
+        把同一个槽里的 redo 日志按照生成的先后顺序使用链表链接起来
+        遍历哈希表，同一页面的 redo 日志在一个槽里，所以可以一次性修好一个页面
+    跳过已经刷新到磁盘的页面
+        数据页 File Header 有 FIL_PAGE_LSN 属性，记载最后修改页面的 mtr 的 redo 日志的 lsn（即控制块的 newest_modification ）
+        如果该页的 FIL_PAGE_LSN > checkpoint_lsn ，则磁盘页已包含 checkpoint_lsn 之前的所有修改，无需恢复
+LOG_BLOCK_HDR_NO
+    略

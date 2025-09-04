@@ -1,0 +1,196 @@
+页面通用部分
+    File Header 记录页面通用信息
+    Empty Space 尚未使用空间，页结构填充
+    File Trailer 校验页是否完整，保证从内存到磁盘刷新时内容的一致性
+    后面展示页属性时，省略这三个结构
+区的组织与管理
+    区 extent
+        64 个页为 1 区，256 个区为 1 组
+        区的状态
+            FREE 空闲的区（直属表空间）
+            FREE_FRAG 有剩余空间的碎片区（直属表空间）
+            FULL_FRAG 没有剩余空间的碎片区（直属表空间）
+            FSEG 附属于某个段的区
+    碎片区
+        对于数据少的索引来说，直接以区为单位分配存储空间，比较浪费
+        碎片区直属于表空间，不属于任何一个段，用于零散页面的分配
+        段分配存储空间的策略
+            一开始，段从碎片区（FREE_FRAG）以单页面为单位分配存储空间
+                碎片区分配后不再有空闲空间，则将该区的状态变成FULL_FRAG
+                如果没有空闲的碎片区，则向表空间申请，把一个空闲区（FREE）改为碎片区
+            段已占用 32 个碎片区页面后，就开始以完整的区为单位来分配存储空间
+    XDES Entry 管理区，每个区对应一个
+        属性
+            Segment ID 区所属的段（只有该区属于某个段时有意义）
+            List Node 与其他 XDES Entry 形成双向链表
+            State 区状态（FREE FREE_FRAG FULL_FRAG FSEG ）
+            Page State Bitmap 标识区内页面空闲情况
+                16 字节 128 位，2 位对应一个页（一个区 64 个页）
+                2 个位中的第 1 个位表示对应的页是否空闲
+    XDES Entry 链表
+        目的
+            为方便管理各种状态的区，需要把各个状态的区组织成链表
+        表空间的 XDES Entry 链表（基节点在 FSP_HDR 页的 File Space Header 中记录）
+            FREE 区对应的 XDES Entry 通过 List Node，组成 FREE 链表
+            FREE_FRAG 区对应的 XDES Entry 通过 List Node，组成 FREE_FRAG 链表
+            FULL_FRAG 区对应的 XDES Entry 通过 List Node，组成 FULL_FRAG 链表
+        段的 XDES Entry 链表（基节点在 INODE Entry 中记录）
+            完全空闲的区对应的 XDES Entry 通过 List Node，组成 FREE 链表
+            部分空闲的区对应的 XDES Entry 通过 List Node，组成 NOT_FULL 链表
+            没有空闲的区对应的 XDES Entry 通过 List Node，组成 FULL 链表
+        基节点 List Base Node        
+            List Length 链表节点数目
+            First Node Page Number 和 First Node Offset 链表的头节点位置
+            Last Node Page Number 和 Last Node Offset 链表的尾节点位置
+段的组织与管理    
+    段 segment
+        为了顺序 IO，叶子节和非叶子节点放到独立的区
+        区的集合就是段，一个索引 2 个段，叶子节点段和非叶子节点段
+        段是零散页面以及一些完整的区的集合   
+    INODE Entry 管理段，每个段对应一个
+        位置
+            基节点指针：FSP_HDR 页 File Space Header 结构的 SEG_INODES_FULL 链表和 SEG_INODES_FREE 链表
+            实际实际：INODE 页
+        属性
+            Segment ID 段的编号
+            NOT_FULL_N_USED 标示已经使用多少个 NOT_FULL 链表中的页面
+            段属 FREE 链表基节点（XDES Entry 链表）
+            段属 NOT_FULL 链表基节点（XDES Entry 链表）
+            段属 FULL 链表基节点（XDES Entry 链表）
+            Magic Number 标记该 INODE Entry 是否已经初始化
+            Fragment Array Entry 段的零散的页面
+独立表空间
+    结构（以下页面都是属于同一个表的）
+        第一个组前 3 页面固定
+            FSP_HDR 页：存储表空间整体属性以及本组所有区的属性，表空间内唯一
+            IBUF_BITMAP 页：存储本组所有区的所有页面关于 INSERT BUFFER 的信息
+            INODE 页：存储 INODE 数据结构
+        其余各组前 2 个页面固定
+            XDES 页：存储本组所有区的属性
+            IBUF_BITMAP 页：同上
+    FSP_HDR 页面
+        File Space Header 表空间整体属性信息
+            Space ID 表空间的ID
+            Next Unused Segment ID 当前表空间下一个未使用的 Segment ID
+            Size 当前表空间占有的页面数
+            FREE Limit 尚未初始化的最小页号
+            FRAG_N_USED 代表 FREE_FRAG 链表中已使用的页面数量
+            表空间 FREE 区 链表的基节点（XDES Entry 链表）
+            表空间 FREE_FREG 区 链表的基节点（XDES Entry 链表）
+            表空间 FULL_FREG 区 链表的基节点（XDES Entry 链表）
+            SEG_INODES_FULL 链表的基节点（INODE Entry 链表）
+            SEG_INODES_FREE 链表的基节点（INODE Entry 链表）
+        XDES Entry 存储本组 256 个区对应的属性信息
+    XDES 页面
+        类似于 FSP_HDR 页面，都需要管理本组内的256个区
+        少了 File Space Header 部分，无需管理表空间整体属性
+    INODE 页面
+        属性
+            List Node for INODE Page List 与其他 INODE 页面形成双向链表
+            INODE Entry 段描述信息（属性在上面已经介绍了）
+        新建段的过程
+            新建段需要新建 INODE Entry，检查 FSP_HDR 页 > File Space Header 结构 > SEG_INODES_FREE 链表是否为空
+            SEG_INODES_FREE 链表不为空
+                直接从该链表中获取一个节点/页面，然后把该 INODE Entry 结构放到该页面中
+                当该页面中无剩余空间时，就把该页放到 SEG_INODES_FULL 链表中
+            SEG_INODES_FREE 链表为空
+                从表空间的 FREE_FRAG 链表中申请一个页面，修改该页面的类型为 INODE
+                把该页面放到 SEG_INODES_FREE 链表中，余下处理参考 SEG_INODES_FREE 链表不为空
+            ps：整体过程和为段分配碎片区页面的过程类似
+        叶子节点段和非叶子节点段的 INODE Entry
+            如何区分一个索引的两个段
+                INDEX 页的 Page Header 部分，有两个 Segment Header 结构的属性
+                PAGE_BTR_SEG_LEAF 记录叶子节点段对应的 INODE Entry 的位置
+                PAGE_BTR_SEG_TOP 记录非叶子节点段对应的 INODE Entry 的位置
+            Segment Header 结构的属性
+                Space ID of the INODE Entry 记录 INODE Entry 所属表空间ID
+                Page Number of the INODE Entry 记录 INODE Entry 所属页面页号
+                Byte Offset of the INODE Ent 记录 INODE Entry 在该页偏移量
+            一个索引只对应两个段，所以只在索引根页面记录这两个结构即可
+系统表空间
+    结构
+        第一组前3个页面和独立表空间相同，页号3～7的页面是系统表空间特有的
+            SYS 存储Insert Buffer的头部信息
+            INDEX 存储Insert Buffer的根页面
+            TRX_SYS 事务系统的相关信息
+            SYS 第一个回滚段的页面
+            SYS 数据字典头 Data Dictionary Header（基本系统表根页面信息）
+        extent 1 和 extent 2 （页号 64 ~ 191）是 Doublewrite buffer 双写缓冲区
+    MySQL除保存用户数据外，还需要保存【元数据】
+        某个表属于哪个表空间，表里边有多少列
+        表对应的每一个列的类型是什么
+        该表有多少索引，每个索引对应哪几个字段
+        该索引对应的根页面在哪个表空间的哪个页面
+        该表有哪些外键，外键对应哪个表的哪些列
+        某个表空间对应文件系统上文件路径是什么
+    内部系统表/数据字典 用于 存储元数据
+        分类（前四个是基本系统表）
+            SYS_TABLES 所有表的信息
+            SYS_COLUMNS 所有列的信息
+            SYS_INDEXES 所有索引的信息
+            SYS_FIELDS 所有索引对应的列的信息
+            SYS_FOREIGN 所有外键的信息
+            SYS_FOREIGN_COLS 所有外键对应列的信息
+            SYS_TABLESPACES 所有表空间信息
+            SYS_DATAFILES 所有表空间对应文件系统的文件路径信息
+            SYS_VIRTUAL 所有虚拟生成列的信息
+        基本系统表
+            SYS_TABLES 表信息
+                字段
+                    NAME 表的名称
+                    ID 表的唯一ID
+                    N_COLS 该表拥有列的个数
+                    TYPE 表的类型，记录了一些文件格式、行格式、压缩等信息
+                    SPACE 该表所属表空间的ID
+                索引
+                    以 NAME 列为主键的聚簇索引
+                    以 ID 列建立的二级索引
+            SYS_COLUMNS 列的信息
+                字段
+                    TABLE_ID 该列所属表对应的ID
+                    POS 该列在表中是第几列
+                    NAME 该列的名称
+                    MTYPE main data type 主数据类型 INT、CHAR、VARCHAR、FLOAT、DOUBLE等
+                    PRTYPE precise type 精确数据类型，是否允许NULL值等
+                    LEN 该列最多占用存储空间的字节数
+                索引
+                    以 (TABLE_ID, POS) 列为主键的聚簇索
+            SYS_INDEXES 索引信息
+                字段
+                    TABLE_ID 该索引所属表对应的ID
+                    ID 索引的唯一ID
+                    NAME 该索引的名称
+                    N_FIELDS 该索引包含列的个数
+                    TYPE 该索引的类型（聚簇索引/唯一索引/更改缓冲区的索引/全文索引/二级索引）
+                    SPACE 该索引根页面所在的表空间ID
+                    PAGE_NO 该索引根页面页号
+                        索引根页面的 Segment Header 是有意义的
+                        通过 PAGE_BTR_SEG_LEAF 定位叶子节点段对应的 INODE Entry 的位置
+                        通过 PAGE_BTR_SEG_TOP 定位非叶子节点段对应的 INODE Entry 的位置
+                索引
+                    以 (TABLE_ID, ID) 列为主键的聚簇索引
+            SYS_FIELDS 索引列信息
+                字段
+                    INDEX_ID 该索引列所属的索引的ID
+                    POS 该索引列在某个索引中是第几列
+                    COL_NAME 该索引列的名称
+                索引
+                    以 (INDEX_ID, POS) 列为主键的聚簇索引
+    Data Dictionary Header
+        位置
+            系统表空间第1组7号页面，页类型为 SYS，记录了 Data Dictionary Header 数据字典头部信息
+        SYS 页属性
+            Segment Header 记录本页面所在段对应的 INODE Entry 位置信息
+            Data Dictionary Header 记录基本系统表根页面位置及InnoDB存储引擎的一些全局信息
+                Max Row ID 给默认 row id 赋值，全局共享
+                Max Table ID 给表赋值唯一ID，自增
+                Max Index ID 给索引赋值唯一ID，自增
+                Max Space ID 给表空间赋值唯一ID，自增
+                Root of SYS_TABLES clust index 指向 SYS_TABLES 表聚簇索引的根页面的页号
+                Root of SYS_TABLE_IDS sec index 指向 SYS_TABLES 表为 ID 列建立的二级索引的根页面的页号
+                Root of SYS_COLUMNS clust index 指向 SYS_COLUMNS 表聚簇索引的根页面的页号
+                Root of SYS_INDEXES clust index 指向 SYS_INDEXES 表聚簇索引的根页面的页号
+                Root of SYS_FIELDS clust index 指向 SYS_FIELDS 表聚簇索引的根页面的页号
+    information_schema 系统数据库
+        用户不能直接访问内部系统表，但可以访问 information_schema 中 innodb_sys* 表
+        存储引擎启动时读取内部系统表，并填充到 innodb_sys* 表中

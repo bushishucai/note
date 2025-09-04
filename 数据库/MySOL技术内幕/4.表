@@ -1,0 +1,132 @@
+innoDB 存储引擎的逻辑存
+    表空间
+        innoDB 存储引擎的逻辑存储结构看，所有数据都被逻辑地存放在表空间中
+        innodb_file_per_table
+            启用该参数，则每张表内的数据（数据/索引/插入缓存/bitmap页）可以单独放到一个表空间内
+            其他类的数据，如回滚信息/插入缓冲索引页/系统事务信息/二次写缓冲等还是存放在原来的共享表空间内
+    段 区 页 行
+行格式
+    Compact
+        变长字段列表
+        null 值列表
+        记录头信息
+        数据列
+            系统默认列：事务id，回滚指针，row id（非必须）
+            用户数据列
+    Redundant
+    行溢出数据
+        VARCHAR
+            长度限制
+                VARCHAR(N) 指的是字符串的长度，而非个数
+                单个列最大不是 65535 而是 65532，因为还有别的开销
+                MySQL 官方手册中定义的 65535 长度是指所有 VARCHAR 列的长度总和
+                如果多个列的长度加起来，总和超出这个长度，依然会创建失败
+            为啥是这个限制
+
+        行溢出
+            正常情况数据放在类型为 B-reenode 的页，行溢出时数据放在类型为 Uncompressed BLOB 的页
+            数据页保存前 768 字节的数据，然后指向行溢出页（Uncompressed BLOB）
+            Compressed 和 Dynamic 存 BLOB 时，数据页中只存放 20 个字节的指针，指向溢出页
+            多长的 VARCHAR 是保存在单个数据页中的，从多长开始又会保存在 BLOB 页?
+                InnoDB存储引擎表是 B+Tree 结构，每个页中至少应该有两条记录，否则变成链表了
+                如果页中只能存放下一条记录，则 InnoDB 存储引擎会自动将行数据存放到溢出页中
+                比如只有一个列，varchar(8098)无需放到溢出列，varchar(9000)需要放到溢出列
+数据页结构
+    File Header 文件头部
+        功能
+            页号 双向链表 页类型 最后LSN 所属表空间
+        属性
+            FIL_PAGE_SPACE_OR_CHKSUM 校验和
+            FIL_PAGE_OFFSET    页号
+            FIL_PAGE_PREV 上一个页的页号
+            FIL_PAGE_NEXT 下一个页的页号
+            FIL_PAGE_TYPE 页的类型
+            FIL_PAGE_LSN 页面被最后修改时对应的日志序列位置（Log Number）            
+            FIL_PAGE_FILE_FLUSH_LSN 仅在系统表空间的一个页中定义，代表文件至少被刷新到了对应的LSN值
+            FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID 页属于哪个表空间
+    Page Header 页面头部
+        功能
+            索引id 垃圾链表头 该页最大事务id 索引段表示
+        属性
+            PAGE_N_DIR_SLOTS 页目录中槽数量
+            PAGE_HEAP_TOP 还未使用的空间最小地址（后面是Free Space）
+            PAGE_N_HEAP 本页中的记录的数量（包括最小和最大记录以及标记为删除的记录）
+            PAGE_FREE 第一个已经标记为删除的记录地址（删除记录通过next record形成垃圾链表）    
+            PAGE_GARBAGE 已删除记录占用的字节数
+            PAGE_LAST_INSERT 最后插入记录的位置
+            PAGE_DIRECTION 记录插入的方向
+            PAGE_N_DIRECTION 一个方向连续插入的记录数量
+            PAGE_N_RECS 该页中用户有效记录的数量（不包括最小最大以及删除记录）
+            PAGE_MAX_TRX_ID 当前页的最大事务ID，该值仅在二级索引中定义
+            PAGE_LEVEL 当前页在B+树中所处的层级
+            PAGE_INDEX_ID 索引ID，表示当前页属于哪个索引
+            PAGE_BTR_SEG_LEAF B+树叶子段的头部信息，仅在B+树的Root页定义
+            PAGE_BTR_SEG_TOP B+树非叶子段的头部信息，仅在B+树的Root页定义
+    Infimum + Supremum
+        记录头的 heap_no 表示当前记录在记录堆的位置信息
+        Supremum 的 heap_no = 1，最大记录，上一条是本页主键最大的用户记录
+        Infimum 的 heap_no = 0，最小记录，下一条是本页主键最小的用户记录
+        Supremum 和 Infimum 挨着，后面才是用户记录
+    用户记录
+        略
+    Page Directory 页目录
+        分组
+            将所有未删除记录（包括 Supremum 和 Infimum ）分组
+            组内最大/最后记录 n_owned 表示该组有多少记录
+            组内最后记录地址偏移量（槽）提取到 Page Directory 页目录
+        规定
+            最小记录组 1 条
+            最大记录组 1 ~ 8 条
+            其余组记录 4 ~ 8 条
+        在数据页查找指定主键记录
+            过程
+                通过二分法确定该记录所在的槽，并找到该槽中主键值最小的那条记录
+                通过记录的 next_record 属性遍历该槽所在的组中的各个记录
+            查找案例
+                四个槽 0(Infimum) 1(id=4) 2(id=8) 3(id=12) 4(Supremum)
+                初始 low=0 high=4，查找找主键值为 6 的记录
+                中间槽位置 (0+4)/2=2，槽 2 对应记录主键 = 8 > 6，设置high=2 low不变
+                中间槽位置 (0+2)/2=1，槽 1 对应记录主键 = 4 < 6，设置low=1 high不变
+                high-low=1，确定 id=6 的记录在槽 2 中，从槽 1 对应记录向后遍历即可找到
+    File Trailer
+        对应File Header中的校验和，用于校验页的完整性
+        前4个字节代表页的校验和，后4个字节代表页最后修改时对应的日志序列位置（LSN）
+        内存中修改过的页，同步到磁盘前，要重新计算校验和，写入File Header和File Trailer
+        File Header在前，会先同步到磁盘，File Trailer在后，会后同步到磁盘
+        磁盘中页，如果两者校验和不相同，说明同步到一半中断了
+约束
+    分类
+        Primary Key
+        Unique Key
+        Foreign Key
+        Default 
+        NOT NULL
+    ENUM 和 SET 约束
+        比如性别列，只能是男女，可通过 ENUM 类型约束实现
+        mySqI > CREATE TABLE a (
+            -> id INT,
+            -> sex ENvM('male','fema1e'));
+视图
+    视图中的数据没有实际的物理存储
+    可更新视图可以通过视图的定义来更新基本表
+    mysql不支持物化视图
+分区表
+    mysql 支持水平分区，不支持垂直分区
+    如果表中存在主键或唯一索引时，分区列必须是唯一索引的一个组成部分
+    分区类型
+        RANGE 分区：行数据基于属于一个【给定连续区间的列】值被放入分区
+            主要用于日期列的分区，便于表的管理
+                删除 2008 年的数据，只需删除对应分区，无需根据条件删除
+                查询 2008 年的数据，只会查询 p2008 这个分区，加速查询
+        LIST 分区：面向的是离散的值
+        HASH 分区：根据用户自定义的表达式的返回值来进行分区
+        KEY 分区：根据 MySQL 数据库提供的哈希函数来进行分区
+     子分区
+     分区对 Null 的处理
+     分区和性能
+        OLTP 在线事务处理：Blog、电子商务、网络游戏
+            通常不会获取一张大表 10% 的数据
+            应该小心使用分区
+        OLAP 在线分析处理：数据仓库、数据集市
+            可能会频繁的扫描一张很大的表，比如根据时间截属性列，查询某一年的数据
+            适合分区

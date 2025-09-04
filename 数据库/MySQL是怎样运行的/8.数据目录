@@ -1,0 +1,23 @@
+数据目录位置
+    SHOW VARIABLES LIKE 'datadir';
+数据目录结构
+    每个数据库都对应数据目录下的一个文件夹
+    db.opt 数据库属性（字符集等）
+    表名.frm 描述表结构
+表空间/文件空间    
+    表空间是逻辑上的，对应文件系统上一个或多个真实文件
+    每一个表空间可以被划分为很多很多很多个页
+    系统表空间
+        数据目录的ibdata1
+    独立表空间
+        在数据库对应子目录下创建【表名.ibd】，每个表建立独立表空间
+MyISAM
+    新建表时，数据库对应目录下会创建
+    表名.frm 表结构
+    表名.MYD 数据文件
+    表名.MYI 索引文件
+系统数据库
+    mysql：用户账户和权限信息，日志信息
+    information_schema：元数据信息，对表/视图/触发器/索引等的描述信息
+    performance_schema：状态信息，性能监控
+    sys：视图展示information_schema和performance_schema

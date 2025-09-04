@@ -1,0 +1,113 @@
+InnoDB 体系架构
+    后台线程（InnoDB 存储引擎是多线程模型）
+        Master thread 脏页刷盘，保证数据的一致性，合并插入缓冲，undo 页的回收等
+        IO thread 负责处理 AIO（异步IO）的回调任务
+        Purge thread 负责回收事务被提交以后，不再需要的 undo 页
+        Page cleaner thread 负责脏页刷盘，减轻 master thread 的工作及对于用户查询线程的阻塞
+    内存
+        缓冲池
+            将从磁盘读到的页存放在缓冲池中，这个过程称为将页【FIX】到缓冲池中
+            将缓冲池中的页刷磁盘，并不是在每次页发生更新时触发，而是通过 Checkpoint 机制刷盘
+            缓冲池中不是只有索引页和数据页，还有 insertbufer，adaptivehashindex，lock info，datadictionary 等
+            可以由多个缓冲池实例，每个页根据哈希值平均分配到不同缓冲池实例中，减少内部竞争
+        各种链表
+            LRU List：缓冲池通过 LRU 算法管理，innoDB 存储引繁对传统的 LRU 算法做了一些优化
+            Flush List：通过 CHECKPOINT 机制将脏页刷新回磁盘，脏页同时存在于 LRU List 和 Flush List
+            Free List：
+                数据库刚启动时，LRU 列表是空的，即没有任何的页，这时页都存放在 Free 列表中
+                当需要从缓冲池中分页时，首先从 Free 列表中查找是否有可用的空闲页
+                    若有则将该页从 Free 列表中删除，放入到 LRU 列表中
+                    否则，根据 LRU 算法，淘汰 LRU 列表末尾的页，将该内存空间分配给新的页
+        重做日志缓冲
+            redo 日志刷盘时机
+                Master Thread 每秒将重做日志缓冲刷新到重做日志文件
+                每个事务提交时会将重做日志缓冲刷新到重做日志文件
+                当重做日志缓冲池剩余空间小于 1/2 时，重做日志缓冲刷新到重做日志文件
+        额外的内存池
+checkpoint 技术
+    假设
+        如果重做日志可无限增大【1】，同时缓冲池能够缓冲所有数据【2】，则无需要将脏页刷盘
+        因为当发生宕机时，可以通过重做日志来恢复整个数据到宕机发生的时刻
+        但这两点是不可能，而且就算满足【1】【2】，重放全量 redo 日志的耗时也太长了
+    Checkpoint 技术的目的是解决以下几个问题
+        缩短崩溃恢复时间
+        缓冲池不够用时（内存），将脏页刷新到磁盘
+        重做日志空间不足（磁盘），刷新脏页
+            事务提交了，但重做日志空间不足，无法记录 redo 日志
+            此时 InnoDB 会强制暂停该事务的提交过程，并同步触发一次 Checkpoint
+            从脏页列表中最旧的脏页开始刷盘，直到释放的日志空间能容纳【当前被阻塞事务的重做日志】
+            此强制刷盘的行为是由尝试提交的事务同步触发的，它会直接感受到由此带来的延迟
+    checkpoint 与脏页
+        脏页的版本比较新，它的数据页头部的LSN会比较新，因为LSN在每次更新的时候都会递增
+        所以只要比 checkpoint 中的LSN大的，那么一定是脏页
+    两种 checkpoint 技术
+        sharp checkpoint：数据库关闭时将【所有的脏页】刷新回到磁盘中
+        fuzzy checkpoint：正常运行时，只刷新部分脏页
+            触发时机
+                master thread checkpoint：定时（每秒一次）将脏页刷盘，异步（用户查询不会受到阻）
+                flush_lru_list checkpoint：保证LRU列表中需要有 100 个左右空闲页可用
+                diry page too much：缓冲池中脏页的数量占据 75% 时，强制进行 Checkpoin，刷新一部分的脏页到磁盘
+                async/sync flush checkpoint：重做日志文件空间不足，需要强制将一些页刷新回磁盘
+                    定义
+                        已经写入到重做日志的 LSN 记为 redo_lsn
+                        已经刷新回磁盘最新页的 LSN 记为 checkpoint_lsn
+                        checkpoint_age = redo_lsn - checkpoint_lsn（崩溃恢复需要这部分 redo 日志）
+                        async_water_mark = 75% * total_redo_log_file_size
+                        sync_water_mark = 90% * total_redo_log_file_size
+                    判断
+                        checkpoint_age < async_water_mark
+                            不需要刷新任何脏页到磁盘
+                        async_water_mark < checkpoint_age < sync_water_mark
+                            触发 Async Flush，从Flush列表中刷新足够的脏页回磁盘
+                            刷新后满足 checkpoint_age < async_water_mark
+                        checkpoint_age > sync_water_mark
+                            触发 Sync Flush，从Flush列表中刷新足够的脏页回磁盘
+                            使得刷新后满足 checkpoint_age < async_water_mark
+Master Thread 工作方式
+    太杂了，再看看
+InnoDB 关键特性
+    插入缓冲 (Insert Buffer)
+        概念
+            Insert Buffer 和数据页一样，也是物理页的一个组成部分
+            对于非聚集索引的插入或更新操作，先判断插人的非聚集索引页是否在缓冲池中
+            在的话，则直接插入; 不在的话，则先放入到一个 Insert Buffer 对象
+            后续把 Inser Buffer 和辅助索引页子节点进行 merge
+            这时通常能将多个插入合并到一个操作中，提高了对于非聚集索引插入的性能
+        使用条件
+            索引是辅助索引且不【唯一】
+            保证唯一性需查询辅助索引，失去 Insert Buffer 的意义
+        问题
+            写密集的情况下，插入缓冲会占用过多的缓冲池内存(innod buffer pool)，最大可以占到 1/2
+        change buffer
+            InnoDB 从 1.0.x 版本开始引入了Change Buffer，可将其视为 Insert Buffer 的升级
+            可以开启各种 buffer 选项（nsers、deletes、purges、changes、all、none、insers、deletes、purge）
+        Insert Buffer的内部实现            
+            Insert Buffer 的数据结构是一棵B+树
+            非叶节点存放的是查询的 search key
+                space（表的 spacc id）
+                marker（容老版本的 Insert Bufer）
+                offset（页所在的偏移量）
+    两次写(Double Write)
+        概念
+            16KB 的页，只写了前4KB，之后就发生了宕机，这就叫部分写失效
+            重做日志中记录的是对页的物理操作，如偏移量800，写 aaaa 记录，如果这个页本身已经发生了损坏，再对其进行重做是没有意义的
+            在应用(apply)重做日志前，需要页的副本，当写入失效发生时，先通过贝的副本来还原该页，再进行重做，这就是double write
+        过程
+            内存中的 double write buffer（2MB），磁盘系统表空间中连续的 128 个页，即 2 个区（2MB）
+            有页的刷新首先都需要放人到内存中的 double write buffer 中，然后写入磁盘系统表空间中，这个过程是顺序写
+            然后再将 double write buffer 中的页写人各个表空间文件中，此时的写入则是离散的
+    自适应哈希索引 (Adaptive Hash Index) AHI
+        InnoDB 存储引擎会自动根据访间的频率和模式来自动地为某些热点页建立哈希索引
+    异步 IO (Async IO)
+        与 AIO 对应的是 Sync IO，即每进行一次IO操作，需要等待此次操作结束才能继绞接下来的操作
+        AIO 的另一个优势是可以进行 IO Merge
+             比如访问：(8，6)、(8，7)，(8，8)，同步 IO 需要 3次 IO操作
+             AIO 会判断到这三个页是连续的，因此 AI O底层会发送一个 IO 请求，从(8，6)开始，读取 48KB 的页。
+
+    刷新邻接页 (Flush Neighbor Page)
+        当刷新一个脏页时，ImnoDB存储引擎会检测该页所在区(extent)的所有页，如果是脏页，那么一起进行刷新
+        通过 AI O可以将多个 IO 写人操作合并为一个 IO 操作
+
+
+
+    

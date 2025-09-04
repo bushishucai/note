@@ -1,0 +1,64 @@
+Buffer Pool
+    概念
+        MySQL 服务器启动时，向操作系统申请了一片连续的内存
+        innodb_buffer_pool_size=268435456（字节，256MB）
+    组成
+        Buffer Pool 中存放控制块（在前）和缓存页（在后）
+        没修改过的缓存页和在磁盘上的数据页完全一致，都是16KB
+        一个缓存页对应一个控制块
+        控制块包含：表空间编号、页号、缓存页在 Buffer Pool 中的地址、链表节点信息、锁信息、LSN 信息等
+    缓存页哈希处理
+        方便判断数据页是否已经加载到 Buffer Pool 中
+        表空间号+页号作为 key ，缓存页地址作为 value ，创建一个哈希表
+        访问某个数据页，先看哈希表有没有，有的话直接从 Buffer Pool 取即可
+        没有的话从 free 链表中选一个空闲缓存页，然后把磁盘中对应的页加载到该缓存页，并更新哈希表
+free 链表
+    所有空闲的缓存页的控制块作为节点放到一个链表中
+flush 链表
+    只要 Buffer Pool 中页被修改过，就算脏页
+    每发生一次修改就立即同步到磁盘上对应的页上，性能太差
+    所以需要用链表记录脏页，找机会统一刷到磁盘中
+LRU 链表（Least Recently Used）
+    Buffer Pool 不够用，需要淘汰一些缓存页（脏页刷盘，或释放未修改的缓存页）
+    简单的LRU链表
+        过程
+            访问的页面不在 Buffer Pool ，页面加载到 Buffer Poo 时，控制块放 LRU链表 头部
+            访问的页面在 Buffer Pool ，把该页控制块移动到 LRU链表 的头部
+        问题1 预读
+            线性预读
+                顺序访问了某个区的 XXX个 页面，则异步读取下一个区中全部的页面到 Buffer Pool
+            随机预读
+                 Buffer Pool 中已经缓存了某个区的 XXX个 连续的页面，则异步读取本区中所有其的页面到 Buffer Pool
+        问题2 全表扫描
+            每次去页面中读取一条记录，都算一次页面访问
+            会将该表所有页都加载到 Buffer Pool 中
+    划分区域的LRU链表
+        按一定比例（可配置）将 LRU链表 划分为 young区 和 old区
+        初次加载到 Buffer Pool 的缓存页，对应控制块放到 old区 头部
+        对于 old区 的缓存页，两次访问时间间隔太短，对应控制块不会 young区 头部，否则将它移动到 young区 头部
+        对于 young区 的缓存页，被访问缓存页对应控制块，位于 young区 的后 1/4，才会被移动到 LRU链表 头部
+刷新脏页到磁盘
+    BUF_FLUSH_LRU方式
+        后台线程会定时从 LRU链表 尾部开始扫描页面
+        如果发现脏页，会把它们刷新到磁盘
+    BUF_FLUSH_LIST方式
+        后台线程会定时从 flush链表 中刷新一部分页面到磁盘
+    BUF_FLUSH_SINGLE_PAGE方式
+        脏页刷盘慢，导致用户线程加载磁盘页到 Buffer Pool 时没有可用的缓存页
+        此时会直接释放（一定数量） LRU链表 尾部的未修改页面
+        如果全是脏页，则同步的将（一定数量） LRU链表 尾部脏页刷盘
+多个 Buffer Pool 实例
+    innodb_buffer_pool_instances大于1G时，可以使用多个 Buffer Pool 实例
+innodb_buffer_pool_chunk_size
+    MySQL 5.7.5 后，可在服务运行时调整 Buffer Pool 大小
+    不再一次性为 Buffer Pool 申请一大片连续内存，而是以 chunk 为单位向操作系统申请空间，每个 Buffer Pool 由若干 chunk 组成
+    innodb_buffer_pool_chunk_size 代表一个 chunk的大小，服务启动时指定，运行时无法修改
+     
+     
+
+
+
+
+
+
+

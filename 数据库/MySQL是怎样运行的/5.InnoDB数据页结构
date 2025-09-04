@@ -1,0 +1,80 @@
+页类型
+    ALLOCATED 最新分配，还没使用
+    UNDO_LOG Undo日志页
+    INODE 段信息节点
+    IBUF_FREE_LIST Insert Buffer空闲列表
+    IBUF_BITMAP Insert Buffer位图
+    SYS 系统页
+    TRX_SYS 事务系统数据
+    FSP_HDR 表空间头部信息
+    XDES 扩展描述页
+    BLOB BLOB页
+    INDEX 索引页
+数据页结构
+    File Header 文件头部
+    Page Header 页面头部
+    Infimum + Supremum 最小记录和最大记录
+    User Records 用户记录
+    Free Space 空闲空间
+    Page Directory 页面目录
+    File Trailer 文件尾部
+File Header 文件头（校验和，页号，上一页下一页，也页类型，表空间，最后修改 lsn，文件总体刷盘 lsn）
+    FIL_PAGE_SPACE_OR_CHKSUM 校验和
+    FIL_PAGE_OFFSET 页号
+    FIL_PAGE_PREV 上一个页的页号
+    FIL_PAGE_NEXT 下一个页的页号
+    FIL_PAGE_TYPE 页的类型
+    FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID 表空间id
+    FIL_PAGE_LSN 页面被最后修改时 lsn
+        数据页修改时，生成一个新的 LSN，并将其记录在该数据页的 FIL_PAGE_LSN（）
+        数据库恢复时，磁盘数据页的 FIL_PAGE_LSN 小于 redo 日志的 lsn，则需要重放日志，否则无需重放
+    FIL_PAGE_FILE_FLUSH_LSN 文件刷盘到 lsn（仅在系统表空间第一个页）
+        标记系统表空间的数据刷新进度，实例级的持久化状态
+        崩溃恢复时，FIL_PAGE_LSN 小于 FIL_PAGE_FILE_FLUSH_LSN 的页已经刷盘，无需恢复
+Page Header 页头（槽数量 事务id 记录数 垃圾链表）
+    PAGE_N_DIR_SLOTS 页目录中槽数量
+    PAGE_HEAP_TOP 还未使用的空间最小地址（后面是Free Space）
+    PAGE_N_HEAP 本页中的记录的数量（包括最小和最大记录以及标记为删除的记录）
+    PAGE_FREE 第一个已经标记为删除的记录地址（删除记录通过next record形成垃圾链表）    
+    PAGE_GARBAGE 已删除记录占用的字节数
+    PAGE_LAST_INSERT 最后插入记录的位置
+    PAGE_DIRECTION 记录插入的方向
+    PAGE_N_DIRECTION 一个方向连续插入的记录数量
+    PAGE_N_RECS 该页中用户有效记录的数量（不包括最小最大以及删除记录）
+    PAGE_MAX_TRX_ID 当前页的最大事务ID，该值仅在二级索引中定义
+    PAGE_LEVEL 当前页在B+树中所处的层级
+    PAGE_INDEX_ID 索引ID，表示当前页属于哪个索引
+    PAGE_BTR_SEG_LEAF B+树叶子段的头部信息，仅在B+树的Root页定义
+    PAGE_BTR_SEG_TOP B+树非叶子段的头部信息，仅在B+树的Root页定义
+Infimum + Supremum
+    记录头的 heap_no 表示当前记录在记录堆的位置信息
+    Supremum 的 heap_no = 1，最大记录，上一条是本页主键最大的用户记录
+    Infimum 的 heap_no = 0，最小记录，下一条是本页主键最小的用户记录
+    Supremum 和 Infimum 挨着，后面才是用户记录
+用户记录
+    略
+Page Directory 页目录
+    分组
+        将所有未删除记录（包括 Supremum 和 Infimum ）分组
+        组内最大/最后记录 n_owned 表示该组有多少记录
+        组内最后记录地址偏移量（槽）提取到 Page Directory 页目录
+    规定
+        最小记录组 1 条
+        其余记录组 4 ~ 8 条
+        最大记录组 1 ~ 8 条
+    在数据页查找指定主键记录
+        过程
+            通过二分法确定该记录所在的槽，并找到该槽中主键值最小的那条记录
+            通过记录的 next_record 属性遍历该槽所在的组中的各个记录
+        查找案例
+            四个槽 0(Infimum) 1(id=4) 2(id=8) 3(id=12) 4(Supremum)
+            初始 low=0 high=4，查找找主键值为 6 的记录
+            中间槽位置 (0+4)/2=2，槽 2 对应记录主键 = 8 > 6，设置high=2 low不变
+            中间槽位置 (0+2)/2=1，槽 1 对应记录主键 = 4 < 6，设置low=1 high不变
+            high-low=1，确定 id=6 的记录在槽 2 中，从槽 1 对应记录向后遍历即可找到
+File Trailer
+    对应 File Header 中的校验和，用于校验页的完整性
+    前 4 个字节代表页的校验和，后 4 个字节代表页最后修改时的 lsn
+    内存中修改过的页，同步到磁盘前，要重新计算校验和，写入 File Header 和 File Trailer
+    File Header 在前，会先同步到磁盘，File Trailer 在后，会后同步到磁盘
+    磁盘中页，如果两者校验和不相同，说明同步到一半中断了

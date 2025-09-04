@@ -1,0 +1,76 @@
+如何保证事务
+    简单粗暴
+        在事务提交完成之前把该事务所修改的所有页面都刷新到磁盘
+    问题
+        只改了一点就刷新一个完整的数据页太浪费了
+        需要刷盘的页面不连续，随机IO刷起来比较慢
+    redo日志
+        可以只记录redo日志，而不是将整个缓存页刷盘
+        空间小，只记录改了什么，不记录完整页面
+        顺序写入，不直接覆盖分散的磁盘页
+redo日志通用结构
+    type 日志的类型
+    space ID 表空间ID
+    page number 页号
+    data 该条 redo 日志的具体内容
+简单的 redo 日志
+    简单的 redo 日志类型（略，不重要）
+    记录哪个页面，哪个偏移量，修改了几个字节，内容是什么
+    row id 的赋值逻辑
+        内存维护一个变量用于给 row id 赋值，全局唯一，自增
+        变量值为 256 倍数时，刷新到系统表空间的 7 号页 Max Row ID（8 字节）
+        系统启动将磁盘中的 Max Row ID + 256 后赋值给前面提到的全局变量
+    修改 Max Row ID 记录 redo 日志
+        这里是先写到 Buffer Pool，再刷到磁盘
+        如果刷盘前宕机，则无法保证数据持久性
+        比如已经用到1024了，但磁盘中还是256，此时会出现 row id 重复的情况
+        修改页面中的该属性时，记录一条 MLOG_8BYTE 的 redo 日志，用于崩溃恢复
+复杂的 redo 日志
+    插入操作的 redo 日志类型（略，不重要）
+    为什么不能用物理日志记录
+        表有多少个索引，就需要更新多少个 B+ 树
+        B+ 树，可能更新叶子节点页或内部节点页，也可能新建页（分裂）
+        可能需要更改一些属性信息
+            修改上一条记录的 next_record
+            修改 File Header 的双向链表（页分裂）
+            修改 Page Header 的 PAGE_N_HEAP 本页记录条数
+            修改 Page Directory 的槽数量
+    以 MLOG_COMP_REC_INSERT 类型的 redo 日志举例
+        省略其他字段
+        n_uniques
+            需要几个字段才能确保记录的唯一性，这样插入记录时可按记录前 n_uniques 个字段进行排序
+            聚簇索引，n_uniques 的值为主键的列数（记录按主键列自然排序）
+            二级索引，n_uniques 的值为索引列数+主键列数（索引列的值相同时，按主键排序）
+        field1_len ~ fieldn_len 该记录各字段长度
+        offset 该记录的前一条记录在页面中的地址，维护前一条记录的 next_record
+    作用
+        MLOG_COMP_REC_INSERT 没有记录 PAGE_N_DIR_SLOTS、PAGE_HEAP_TOP、PAGE_N_HEAP 等信息
+        只是把在本页面中插入一条记录，所必备的所有要素记了下来，指明了对哪个表空间的哪个页进行了哪些修
+        系统奔溃重启时，服务器会调用相关插入记录的函数，redo 日志中相关据作为参数
+        在调用完该函数后，页面中的 PAGE_N_DIR_SLOTS、PAGE_HEAP_TOP、PAGE_N_HEAP 等都会恢复
+Mini-Transaction
+    redo 日志划分成了若干个不可分割的组
+        更新 Max Row ID 属性时产生的 redo 日志是不可分割的（只有一条）
+        向聚簇索引对应 B+ 树插入一条记录时产生的 redo 日志是不可分割的（可能有多条）
+    乐观插入
+        修改一个页面，记录一条 redo 日志
+    悲观插入
+        修改多个页面，记录一组 redo 日志（多条）
+        在该组 redo 日志末尾加一条类型为 MLOG_MULTI_REC_END 的 redo 日志
+    Mini-Transaction
+        对底层页面中的一次原子访问称为一个 Mini-Transaction ，简称 mtr（不可分割的组）
+        一个事务可包含多条语句，一条语句包含多个 mtr ，一个 mtr 可包含多条 redo 日志
+redo 日志写入过程
+    redo 日志存储在 block 页中（512 字节）
+    block 结构
+        log block header（12字节）
+            LOG_BLOCK_HDR_NO 唯一标识
+            LOG_BLOCK_HDR_DATA_LEN 长度（初始12 最大512）
+            LOG_BLOCK_FIRST_REC_GROUP 该 block 首个 mtr 生成的第一条 redo 日志的偏移量
+            LOG_BLOCK_CHECKPOINT_NO 记录 checkpoint 序号
+        log block body
+        log block trailer 校验和（4字节）
+    redo 日志缓冲区 log buffer
+        服务启动时申请一段连续内存，redo 日志先写到 log buffer
+        buf_free 指明在 log buffer 中继续写入的位置
+        不同事务的 mtr 可能是交替写入 log buffer    

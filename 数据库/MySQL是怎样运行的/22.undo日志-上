@@ -1,0 +1,77 @@
+事务id
+    开启事务
+        START TRANSACTION READ ONLY 开启只读事务
+            不可操作普通表，第一次操作用户创建的临时表会分配事务id，否则不分配
+        START TRANSACTION READ WRITE 开启读写事务
+            第一次操作普通/临时表分配事务id，否则不分配
+    分配事务id
+        系统表空间 5 号页的 Max Trx ID 属性
+        分配逻辑和 row id 类似
+    trx_id 隐藏列
+undo 日志的格式
+    FIL_PAGE_UNDO_LOG 页记录 undo 日志
+        可以从系统表空间中分配
+        或 undo 日志的表空间分配
+    table id
+        每个表都会被分配一个唯一的 table id
+        在 information_schema 库的 innodb_sys_tables 表中可以查到
+    通用结构（下面具体类型会省略通用结构）
+        end of record 本条结束，下一条开始
+        undo type 日志类型
+        undo no 日志编号
+        table id 表 id
+        ... ...
+        start of record 本条开始，上一条结束
+INSERT 操作对应的 undo 日志
+    TRX_UNDO_INSERT_REC 类型 undo 日志（对应 insert 操作）
+        List <len, value> 主键信息列表（长度和值）
+    roll_pointer 指向记录对应的 undo 日志
+DELETE 操作对应的 undo 日志
+    删除操作的两个阶段
+        delete mark 阶段
+            将记录的delete_mask 标识位设置为 1
+            修改 trx_id，roll pointer
+        purge 阶段
+            该删除语句所在的事务提交后，后台线程从正常记录链表移除该记录，插入垃圾链表头结点
+            更新页面用户记录数 PAGE_N_RECS 、垃圾链表头节点的指针 PAGE_FREE 、页目录等信息
+    TRX_UNDO_DEL_MARK_REC 类型 undo 日志（对应 deklete 操作）
+        old trx_id 该记录的旧的 trx_id
+        old roll_pointer 该记录的旧的 roll_pointer
+        List <len, value> 主键信息列表（长度和值）
+        index_col_info len 本部分和索引信息列表长度之和
+        List <pos, len, value> 索引信息列表（位置，长度，值）
+    记录 delete mark 前，会把该记录的旧的 trx_id 和 roll_pointer 记到对应的undo日志
+    一条记录的 undo 日志 通过 old roll_pointer 可以串联起来，形成版本链
+UPDATE 操作对应的 undo 日志
+    不更新主键的情况
+        就地更新，所有列更新后长度不变
+        先删再插，有的列更新后长度改变
+            删除不是 delete mark ，而 purge 操作
+            不是后台线程来执行，而是由用户线程同步执行
+            新纪录长度不超过旧记录，可直接重用被加入到垃圾链表中的旧记录所占用的空间
+            新纪录长度超过旧记录，需要在页面中新申请一段空间，或页分裂后再插入新纪录
+        TRX_UNDO_UPD_EXIST_REC 类型 undo 日志（对应不更新主键的更新操作）
+            old trx_id 该记录的旧的 trx_id
+            old roll_pointer 该记录的旧的 roll_pointer
+            List <len, value> 主键信息列表（长度和值）
+            n_update 更新的列数量
+            List <pos, old_len, old_value> 列更新前的信息
+            index_col_info len 本部分和索引信息列表长度之和
+            List <pos, len, value> 索引信息列表（位置，长度，值）
+    更新主键的情况
+        将旧记录进行 delete mark（记录一条 TRX_UNDO_DEL_MARK_REC）
+        创建新记录，重新定位插入位置，插入到聚簇索引（记录一条 TRX_UNDO_INSERT_REC）
+        
+        
+
+
+
+
+
+
+
+
+
+
+
+
